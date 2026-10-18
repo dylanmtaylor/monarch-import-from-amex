@@ -8,6 +8,8 @@ from amex_to_monarch.parser import (
     build_continuous_daily_balances,
     AmexAccountHistory,
     parse_amex_dataset,
+    parse_amex_pdf_statement,
+    parse_amex_statements_dir,
 )
 
 
@@ -184,6 +186,76 @@ class TestParser(unittest.TestCase):
 
         empty_parsed = parse_amex_dataset({})
         self.assertEqual(len(empty_parsed), 0)
+
+    def test_parse_amex_pdf_statement_synthetic(self):
+        """Test parsing statement layout using synthetic plain text."""
+        synthetic_text = """
+             Blue Cash Preferred from American Express
+             Closing Date 01/03/16
+             Account Ending 1-92003
+
+             Account Summary
+             Previous Balance                         $0.00
+             Payments/Credits                      -$150.00
+             New Charges                         +$1,431.59
+             New Balance                          $1,356.59
+
+             Detail
+             12/15/15   MEMBER AUTO SHOPPING         $1,214.80
+             12/16/15   GROCERY MARKET                  $13.31
+             12/23/15*  STATEMENT CREDIT              -$150.00
+        """
+        res = parse_amex_pdf_statement(synthetic_text)
+        self.assertEqual(res["statement_end_date"], "2016-01-03")
+        self.assertEqual(res["account_ending"], "92003")
+        self.assertEqual(res["statement_balance"], 1356.59)
+        self.assertEqual(res["previous_balance"], 0.0)
+        self.assertEqual(res["payments_credits_amount"], -150.00)
+        self.assertEqual(res["charges_amount"], 1431.59)
+        self.assertEqual(len(res["transactions"]), 3)
+        self.assertEqual(res["transactions"][0]["date"], "2015-12-15")
+        self.assertEqual(res["transactions"][0]["amount"], 1214.80)
+        self.assertEqual(res["transactions"][0]["type"], "DEBIT")
+        self.assertEqual(res["transactions"][2]["date"], "2015-12-23")
+        self.assertEqual(res["transactions"][2]["amount"], -150.00)
+        self.assertEqual(res["transactions"][2]["type"], "CREDIT")
+
+    def test_merge_statement_pdf_data(self):
+        """Test merging PDF checkpoints and transactions into AmexAccountHistory."""
+        acct = AmexAccountHistory(
+            card_name="Blue Cash Preferred",
+            display_account_number="92003",
+            account_token="TOKEN_SYNTH",
+            current_balance=100.0,
+        )
+        acct.statement_checkpoints = [
+            {"statement_end_date": "2026-10-02", "statement_balance": 100.0}
+        ]
+        acct.transactions = [
+            {"post_date": "2026-10-01", "amount": 25.0, "description": "COFFEE SHOP"}
+        ]
+
+        pdf_checkpoints = [
+            {"statement_end_date": "2016-01-03", "statement_balance": 500.0},
+            {"statement_end_date": "2026-10-02", "statement_balance": 100.0},  # duplicate date
+        ]
+        pdf_txns = [
+            {"date": "2015-12-20", "amount": 50.0, "description": "GROCERY MARKET"},
+            {"date": "2026-10-01", "amount": 25.0, "description": "COFFEE SHOP"},  # duplicate
+        ]
+
+        acct.merge_statement_pdf_data(pdf_checkpoints, pdf_txns)
+        self.assertEqual(len(acct.statement_checkpoints), 2)
+        self.assertEqual(acct.statement_checkpoints[0]["statement_end_date"], "2016-01-03")
+        self.assertEqual(acct.statement_checkpoints[1]["statement_end_date"], "2026-10-02")
+        self.assertEqual(len(acct.transactions), 2)
+        self.assertEqual(acct.transactions[0]["date"], "2015-12-20")
+
+    def test_parse_amex_statements_dir_empty_or_nonexistent(self):
+        """Test parsing from nonexistent or empty directory."""
+        cps, txs = parse_amex_statements_dir("/nonexistent/directory")
+        self.assertEqual(cps, [])
+        self.assertEqual(txs, [])
 
 
 if __name__ == "__main__":

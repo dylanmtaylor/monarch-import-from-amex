@@ -1,8 +1,9 @@
-"""Data parsing, transaction normalization, and continuous daily balance history reconstruction."""
-
+import os
+import glob
+import subprocess
 import re
 from datetime import datetime, date, timedelta
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple, Union
 from collections import defaultdict
 
 
@@ -294,6 +295,40 @@ class AmexAccountHistory:
         )
         return self.daily_balances
 
+    def merge_statement_pdf_data(
+        self,
+        checkpoints: List[Dict[str, Any]],
+        transactions: List[Dict[str, Any]],
+    ) -> None:
+        """Merge historical checkpoints and transactions parsed from statement PDFs."""
+        # Merge checkpoints by statement_end_date
+        existing_cp_dates = {cp.get("statement_end_date") for cp in self.statement_checkpoints if cp.get("statement_end_date")}
+        for cp in checkpoints:
+            d = cp.get("statement_end_date")
+            if d and d not in existing_cp_dates:
+                self.statement_checkpoints.append(cp)
+                existing_cp_dates.add(d)
+
+        self.statement_checkpoints.sort(key=lambda x: str(x.get("statement_end_date", "")))
+
+        # Merge transactions deduplicating on (date, amount, description)
+        existing_tx_keys = set()
+        for tx in self.transactions:
+            d = tx.get("post_date") or tx.get("charge_date") or tx.get("date")
+            amt = round(float(tx.get("amount", 0.0)), 2)
+            desc = (tx.get("description") or "").strip().upper()[:25]
+            existing_tx_keys.add((d, amt, desc))
+
+        for tx in transactions:
+            d = tx.get("date") or tx.get("post_date")
+            amt = round(float(tx.get("amount", 0.0)), 2)
+            desc = (tx.get("description") or "").strip().upper()[:25]
+            if (d, amt, desc) not in existing_tx_keys:
+                self.transactions.append(tx)
+                existing_tx_keys.add((d, amt, desc))
+
+        self.transactions.sort(key=lambda x: str(x.get("post_date") or x.get("charge_date") or x.get("date", "")))
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize account history to dictionary."""
         return {
@@ -329,6 +364,132 @@ class AmexAccountHistory:
         return acct
 
 
+def parse_amex_pdf_statement(pdf_source: Any) -> Dict[str, Any]:
+    """
+    Parse an American Express statement PDF from a file path, raw bytes, or text.
+    Extracts closing date, account ending, balances, and itemized transactions.
+    """
+    text = ""
+    if isinstance(pdf_source, (bytes, bytearray)):
+        proc = subprocess.Popen(["pdftotext", "-layout", "-", "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, _ = proc.communicate(input=pdf_source)
+        text = out.decode("utf-8", errors="replace")
+    elif isinstance(pdf_source, str):
+        if pdf_source.startswith("%PDF") or "\n" in pdf_source:
+            text = pdf_source
+        elif os.path.exists(pdf_source):
+            out = subprocess.check_output(["pdftotext", "-layout", pdf_source, "-"], stderr=subprocess.DEVNULL)
+            text = out.decode("utf-8", errors="replace")
+        else:
+            text = pdf_source
+
+    # 1. Closing date
+    m_closing = re.search(r"Closing Date\s+(\d{2}/\d{2}/\d{2,4})", text)
+    closing_date_str = m_closing.group(1) if m_closing else None
+
+    # 2. Account ending
+    m_acct = re.search(r"Account Ending\s+(?:[\d-]*\b)?(\d{5})\b", text)
+    if not m_acct:
+        m_acct = re.search(r"Account Ending\s+.*?(\d{4,5})\b", text)
+    account_ending = m_acct.group(1) if m_acct else ""
+
+    # 3. Balances
+    m_prev = re.search(r"Previous Balance\s+([+-]?\$?[\d,]+\.\d{2})", text)
+    m_pay = re.search(r"(?:Payments/Credits|Less Payments/Credits)\s+([+-]?\$?[\d,]+\.\d{2})", text)
+    m_chg = re.search(r"(?:New Charges|Plus New Charges)\s+([+-]?\$?[\d,]+\.\d{2})", text)
+    m_bal = re.search(r"(?:New Balance|Equals New Balance)\s+([+-]?\$?[\d,]+\.\d{2})", text)
+
+    def to_float(val_str: Optional[str]) -> float:
+        if not val_str:
+            return 0.0
+        s = val_str.replace("$", "").replace(",", "").strip()
+        return float(s)
+
+    c_date = None
+    if closing_date_str:
+        parts = closing_date_str.split("/")
+        yr = int(parts[2])
+        if yr < 100:
+            yr += 2000
+        c_date = date(yr, int(parts[0]), int(parts[1]))
+
+    # 4. Itemized transactions
+    tx_pattern = re.compile(r"^\s*(\d{2}/\d{2}/\d{2})\*?\s+([A-Za-z0-9\s\.\*\#\-\&\'\,]+?)\s+([+-]?\$?[\d,]+\.\d{2})\s*$", re.MULTILINE)
+    transactions = []
+    for m in tx_pattern.finditer(text):
+        tx_d_str, desc, amt_str = m.groups()
+        desc_clean = desc.strip()
+        if any(w in desc_clean.upper() for w in ["CLOSING DATE", "PREVIOUS BALANCE", "NEW BALANCE", "MINIMUM PAYMENT", "PAYMENT DUE", "LATE PAYMENT WARNING"]):
+            continue
+        amt = to_float(amt_str)
+        tparts = tx_d_str.split("/")
+        tyr = int(tparts[2])
+        if tyr < 100:
+            tyr += 2000
+        tx_d = date(tyr, int(tparts[0]), int(tparts[1]))
+        
+        is_credit = amt < 0 or "CREDIT" in desc_clean.upper() or "PAYMENT" in desc_clean.upper()
+        transactions.append({
+            "date": tx_d.isoformat(),
+            "description": desc_clean,
+            "amount": amt,
+            "type": "CREDIT" if is_credit else "DEBIT",
+            "source": "statement_pdf"
+        })
+
+    return {
+        "statement_end_date": c_date.isoformat() if c_date else None,
+        "account_ending": account_ending,
+        "statement_balance": to_float(m_bal.group(1)) if m_bal else 0.0,
+        "previous_balance": to_float(m_prev.group(1)) if m_prev else 0.0,
+        "payments_credits_amount": to_float(m_pay.group(1)) if m_pay else 0.0,
+        "charges_amount": to_float(m_chg.group(1)) if m_chg else 0.0,
+        "transactions": transactions,
+    }
+
+
+def parse_amex_statements_dir(directory: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Parse all Amex statement PDFs in a directory.
+    Returns (checkpoints, transactions) sorted chronologically.
+    """
+    if not os.path.exists(directory):
+        return [], []
+
+    pdf_files = sorted(glob.glob(os.path.join(directory, "*.pdf")))
+    checkpoints = []
+    all_transactions = []
+    seen_tx_keys = set()
+
+    for p in pdf_files:
+        try:
+            with open(p, "rb") as fp:
+                hdr = fp.read(5)
+                if not hdr.startswith(b"%PDF"):
+                    continue
+            stmt = parse_amex_pdf_statement(p)
+            end_date = stmt.get("statement_end_date")
+            if end_date:
+                checkpoints.append({
+                    "statement_end_date": end_date,
+                    "statement_balance": stmt.get("statement_balance", 0.0),
+                    "previous_balance": stmt.get("previous_balance", 0.0),
+                    "charges_amount": stmt.get("charges_amount", 0.0),
+                    "payments_credits_amount": stmt.get("payments_credits_amount", 0.0),
+                })
+            for tx in stmt.get("transactions", []):
+                key = (tx.get("date"), round(float(tx.get("amount", 0.0)), 2), (tx.get("description") or "").strip().upper()[:25])
+                if key not in seen_tx_keys:
+                    seen_tx_keys.add(key)
+                    all_transactions.append(tx)
+        except Exception:
+            continue
+
+    checkpoints.sort(key=lambda x: str(x.get("statement_end_date", "")))
+    all_transactions.sort(key=lambda x: str(x.get("date", "")))
+    return checkpoints, all_transactions
+
+
 def parse_amex_dataset(raw_data: Any) -> List[AmexAccountHistory]:
     """
     Parse a raw Amex JSON dataset (single card dict, list of card dicts, or wrapper dict).
@@ -344,4 +505,5 @@ def parse_amex_dataset(raw_data: Any) -> List[AmexAccountHistory]:
         if "card_name" in raw_data or "transactions" in raw_data or "display_account_number" in raw_data:
             return [AmexAccountHistory.from_dict(raw_data)]
     return []
+
 

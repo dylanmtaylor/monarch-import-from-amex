@@ -9,7 +9,7 @@ from typing import Optional, List, Dict, Any
 
 from amex_to_monarch.cdp import find_amex_tab, CDPClient, CDPError
 from amex_to_monarch.api import AmexAPI, APIError
-from amex_to_monarch.parser import AmexAccountHistory, parse_amex_dataset
+from amex_to_monarch.parser import AmexAccountHistory, parse_amex_dataset, parse_amex_statements_dir
 from amex_to_monarch.exporter import Exporter
 
 logger = logging.getLogger("amex_to_monarch")
@@ -161,6 +161,7 @@ def run_pipeline(
     cache_file: Optional[str] = "amex_raw_data.json",
     invert_liability: bool = True,
     input_file: Optional[str] = None,
+    statements_dir: Optional[str] = "statements",
 ):
     """Run full automated capture and export pipeline."""
     os.makedirs(output_dir, exist_ok=True)
@@ -190,15 +191,23 @@ def run_pipeline(
             print(f"CDP Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-        # Cache raw data if requested
-        if cache_file and accounts:
-            print(f"\nSaving raw dataset cache to '{cache_file}'...")
-            try:
-                raw_payload = [a.to_dict() for a in accounts]
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(raw_payload, f, indent=2)
-            except Exception as e:
-                print(f"Warning: Failed to save raw cache file: {e}")
+    # Ingest historical statement PDFs if available
+    if statements_dir and os.path.exists(statements_dir):
+        print(f"\nParsing statement PDFs from '{statements_dir}'...")
+        pdf_checkpoints, pdf_txns = parse_amex_statements_dir(statements_dir)
+        print(f"  Parsed {len(pdf_checkpoints)} statement checkpoints and {len(pdf_txns)} transactions from PDFs.")
+        for acct in accounts:
+            acct.merge_statement_pdf_data(pdf_checkpoints, pdf_txns)
+
+    # Cache raw data if requested
+    if cache_file and accounts:
+        print(f"\nSaving raw dataset cache to '{cache_file}'...")
+        try:
+            raw_payload = [a.to_dict() for a in accounts]
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(raw_payload, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to save raw cache file: {e}")
 
     print("\nExporting continuous daily balances and transactions to Monarch CSVs...")
     exporter = Exporter(output_dir=output_dir)
@@ -240,6 +249,7 @@ def run_convert(
     input_file: str,
     output_dir: str = "output",
     invert_liability: bool = True,
+    statements_dir: Optional[str] = "statements",
 ):
     """Convert an existing JSON cache file to Monarch CSVs."""
     if not os.path.exists(input_file):
@@ -254,6 +264,14 @@ def run_convert(
     if not accounts:
         print(f"Error: No valid account data found in '{input_file}'.", file=sys.stderr)
         sys.exit(1)
+
+    # Ingest historical statement PDFs if available
+    if statements_dir and os.path.exists(statements_dir):
+        print(f"\nParsing statement PDFs from '{statements_dir}'...")
+        pdf_checkpoints, pdf_txns = parse_amex_statements_dir(statements_dir)
+        print(f"  Parsed {len(pdf_checkpoints)} statement checkpoints and {len(pdf_txns)} transactions from PDFs.")
+        for acct in accounts:
+            acct.merge_statement_pdf_data(pdf_checkpoints, pdf_txns)
 
     exporter = Exporter(output_dir=output_dir)
     exporter.export_all(accounts, invert_liability=invert_liability)
@@ -275,6 +293,7 @@ def main():
     p_all.add_argument("--cache-file", type=str, default="amex_raw_data.json", help="Path to cache raw captured data")
     p_all.add_argument("--positive-balances", action="store_true", help="Do not invert credit card liability balances")
     p_all.add_argument("--input-file", type=str, default=None, help="Path to existing JSON dataset (skip CDP)")
+    p_all.add_argument("--statements-dir", type=str, default="statements", help="Directory containing downloaded statement PDFs")
 
     # Command: capture
     p_capture = subparsers.add_parser("capture", help="Capture raw data from Chrome CDP into JSON cache")
@@ -287,6 +306,7 @@ def main():
     p_convert.add_argument("input_file", type=str, help="Path to raw JSON dataset")
     p_convert.add_argument("--output-dir", type=str, default="output", help="Directory for Monarch CSVs (default: output)")
     p_convert.add_argument("--positive-balances", action="store_true", help="Do not invert credit card liability balances")
+    p_convert.add_argument("--statements-dir", type=str, default="statements", help="Directory containing downloaded statement PDFs")
 
     args = parser.parse_args()
 
@@ -298,6 +318,7 @@ def main():
             cache_file=getattr(args, "cache_file", "amex_raw_data.json"),
             invert_liability=not getattr(args, "positive_balances", False),
             input_file=getattr(args, "input_file", None),
+            statements_dir=getattr(args, "statements_dir", "statements"),
         )
     elif args.command == "capture":
         run_capture(
@@ -310,6 +331,7 @@ def main():
             input_file=args.input_file,
             output_dir=args.output_dir,
             invert_liability=not args.positive_balances,
+            statements_dir=args.statements_dir,
         )
     else:
         parser.print_help()
