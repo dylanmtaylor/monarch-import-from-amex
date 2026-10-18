@@ -192,7 +192,7 @@ class TestParser(unittest.TestCase):
         synthetic_text = """
              Blue Cash Preferred from American Express
              Closing Date 01/03/16
-             Account Ending 1-92003
+             Account Ending 1-88888
 
              Account Summary
              Previous Balance                         $0.00
@@ -207,7 +207,7 @@ class TestParser(unittest.TestCase):
         """
         res = parse_amex_pdf_statement(synthetic_text)
         self.assertEqual(res["statement_end_date"], "2016-01-03")
-        self.assertEqual(res["account_ending"], "92003")
+        self.assertEqual(res["account_ending"], "88888")
         self.assertEqual(res["statement_balance"], 1356.59)
         self.assertEqual(res["previous_balance"], 0.0)
         self.assertEqual(res["payments_credits_amount"], -150.00)
@@ -224,7 +224,7 @@ class TestParser(unittest.TestCase):
         """Test merging PDF checkpoints and transactions into AmexAccountHistory."""
         acct = AmexAccountHistory(
             card_name="Blue Cash Preferred",
-            display_account_number="92003",
+            display_account_number="88888",
             account_token="TOKEN_SYNTH",
             current_balance=100.0,
         )
